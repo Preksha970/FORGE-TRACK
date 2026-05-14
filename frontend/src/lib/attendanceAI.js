@@ -1,7 +1,62 @@
-import { genAI } from './gemini.js';
 import { parseDate } from './spreadsheetParser.js';
 
-const MODEL_NAME = 'gemini-pro';
+const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY;
+const GROQ_MODEL = 'llama-3.3-70b-versatile';
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+/**
+ * Retry a function with exponential backoff for rate-limit/quota errors.
+ */
+async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 2000) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isRetryable = err.message?.includes('429') ||
+        err.message?.includes('quota') ||
+        err.message?.includes('rate') ||
+        err.status === 429;
+
+      if (!isRetryable || attempt === maxRetries) {
+        throw err;
+      }
+
+      const delay = baseDelay * Math.pow(2, attempt);
+      console.warn(`Groq API rate limited. Retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
+
+/**
+ * Call Groq API (OpenAI-compatible) and return the text response.
+ */
+async function callGroq(systemPrompt, userPrompt) {
+  const response = await fetch(GROQ_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      temperature: 0.1,
+      max_tokens: 4096,
+    }),
+  });
+
+  if (!response.ok) {
+    const errBody = await response.text();
+    throw new Error(`Groq API error (${response.status}): ${errBody}`);
+  }
+
+  const data = await response.json();
+  return data.choices[0].message.content;
+}
 
 /**
  * Build the system prompt for the attendance AI agent.
@@ -41,12 +96,10 @@ RESPOND ONLY with valid JSON matching this schema:
 }
 
 /**
- * Analyze a sheet's structure with Gemini AI and return column mappings.
+ * Analyze a sheet's structure with AI and return column mappings.
  */
 export async function analyzeSheet(sheetSummary, sheetName) {
-  const model = genAI.getGenerativeModel({ model: MODEL_NAME });
-
-  const promptText = `${buildSystemPrompt()}\n\nAnalyze this spreadsheet sheet named "${sheetName}".
+  const userPrompt = `Analyze this spreadsheet sheet named "${sheetName}".
   
   Sheet has ${sheetSummary.totalRows} rows and ${sheetSummary.totalCols} columns.
   Header appears to start at row index ${sheetSummary.headerRowIdx}.
@@ -63,14 +116,8 @@ export async function analyzeSheet(sheetSummary, sheetName) {
   - If dates appear as 5-digit numbers, they are Excel serial dates
   - If dates are missing (e.g., "Day 1" without actual dates), set hasDate=false`;
 
-  const result = await model.generateContent({
-    contents: [{ role: 'user', parts: [{ text: promptText }] }],
-    generationConfig: {
-      temperature: 0.1,
-    },
-  });
+  const text = await retryWithBackoff(() => callGroq(buildSystemPrompt(), userPrompt));
 
-  const text = result.response.text();
   let mapping;
   try {
     mapping = JSON.parse(text);
@@ -105,9 +152,9 @@ export async function analyzeSheet(sheetSummary, sheetName) {
  * Uses the user's class schedule (which days of the week) and a reference date.
  */
 export async function suggestMissingDates(missingCols, classDays, referenceDate, totalSessionCount) {
-  const model = genAI.getGenerativeModel({ model: MODEL_NAME });
-
-  const promptText = `You are a scheduling assistant. Respond ONLY with valid JSON.\n\nI have ${missingCols.length} sessions labeled: ${missingCols.map(c => c.label).join(', ')}
+  const systemPrompt = 'You are a scheduling assistant. Respond ONLY with valid JSON.';
+  
+  const userPrompt = `I have ${missingCols.length} sessions labeled: ${missingCols.map(c => c.label).join(', ')}
   
   The class usually happens on these days of the week: ${classDays.join(', ')}
   ${referenceDate ? `A known reference date for one session is: ${referenceDate}` : 'No reference date is available.'}
@@ -122,14 +169,8 @@ export async function suggestMissingDates(missingCols, classDays, referenceDate,
     ...
   ]`;
 
-  const result = await model.generateContent({
-    contents: [{ role: 'user', parts: [{ text: promptText }] }],
-    generationConfig: {
-      temperature: 0.2,
-    },
-  });
+  const text = await retryWithBackoff(() => callGroq(systemPrompt, userPrompt));
 
-  const text = result.response.text();
   try {
     return JSON.parse(text);
   } catch {
